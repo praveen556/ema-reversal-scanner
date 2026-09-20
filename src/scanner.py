@@ -9,6 +9,7 @@ from config import (
     TEST_TICKERS,
     MIN_PRICE,
     MIN_AVG_VOLUME,
+    MIN_20D_RANGE_PCT,
     EMA_FAST,
     EMA_SLOW,
     EMA_20,
@@ -732,6 +733,127 @@ def scan_ticker_from_batch(ticker, batch_data):
         and volume_ok
     )
 
+    # =========================================================
+    # DAILY TREND STRUCTURE
+    # =========================================================
+
+    above_ema20 = (
+        price > float(latest["EMA20"])
+    )
+
+    above_ema50 = (
+        price > float(latest["EMA50"])
+    )
+
+    above_ema89 = (
+        price > float(latest["EMA89"])
+    )
+
+    structure89_ok = (
+        above_ema20
+        and above_ema50
+    )
+
+    structure200_ok = (
+        above_ema89
+    )
+
+    # =========================================================
+    # EMA COMPRESSION
+    # =========================================================
+
+    ema_high = max(
+        float(latest["EMA20"]),
+        float(latest["EMA50"]),
+        float(latest["EMA89"]),
+        float(latest["EMA200"])
+    )
+
+    ema_low = min(
+        float(latest["EMA20"]),
+        float(latest["EMA50"]),
+        float(latest["EMA89"]),
+        float(latest["EMA200"])
+    )
+
+    ema_compression_pct = (
+        (ema_high - ema_low)
+        / price
+        * 100
+    )
+
+    # =========================================================
+    # 20-DAY PRICE RANGE
+    # =========================================================
+
+    recent_20 = df.iloc[-20:]
+
+    high_20 = float(
+        recent_20["High"].max()
+    )
+
+    low_20 = float(
+        recent_20["Low"].min()
+    )
+
+    range_20_pct = (
+        (high_20 - low_20)
+        / low_20
+        * 100
+    )
+
+    range_20_ok = (
+        range_20_pct >= MIN_20D_RANGE_PCT
+    )
+
+    if high_20 > low_20:
+        range_position_20 = (
+            (price - low_20)
+            / (high_20 - low_20)
+            * 100
+        )
+    else:
+        range_position_20 = 50.0
+
+    # =========================================================
+    # 20-DAY EMA CROSS COUNT
+    # =========================================================
+
+    close_above_ema89 = (
+        recent_20["Close"] > recent_20["EMA89"]
+    )
+
+    close_above_ema200 = (
+        recent_20["Close"] > recent_20["EMA200"]
+    )
+
+    ema89_cross_count = (
+        close_above_ema89
+        != close_above_ema89.shift(1)
+    ).iloc[1:].sum()
+
+    ema200_cross_count = (
+        close_above_ema200
+        != close_above_ema200.shift(1)
+    ).iloc[1:].sum()
+
+    ema_cross_count_20d = int(
+        ema89_cross_count + ema200_cross_count
+    )
+
+    # =========================================================
+    # CHOPPY WARNING
+    # =========================================================
+
+    choppy_warning = (
+        ema_compression_pct < 3.0
+        and ema_cross_count_20d >= 8
+    )
+
+    # =========================================================
+    # DETERMINE DAILY SIGNAL + STRUCTURE
+    # =========================================================
+
     if signal89 and signal200:
 
         signal = "EMA89 + EMA200"
@@ -751,9 +873,15 @@ def scan_ticker_from_batch(ticker, batch_data):
             * 100,
         )
 
+        daily_structure_ok = (
+            structure89_ok
+            or structure200_ok
+        )
+
     elif signal89:
 
         signal = "EMA89"
+
         days_ago = days_ago_89
 
         distance_pct = (
@@ -762,9 +890,12 @@ def scan_ticker_from_batch(ticker, batch_data):
             * 100
         )
 
+        daily_structure_ok = structure89_ok
+
     elif signal200:
 
         signal = "EMA200"
+
         days_ago = days_ago_200
 
         distance_pct = (
@@ -773,17 +904,21 @@ def scan_ticker_from_batch(ticker, batch_data):
             * 100
         )
 
+        daily_structure_ok = structure200_ok
+
     else:
 
         signal = "NO SIGNAL"
         days_ago = None
         distance_pct = None
+        daily_structure_ok = False
+
 
     return {
         "Ticker": ticker,
         "Signal": signal,
         "Days Ago": days_ago,
-
+        "Daily Structure OK": daily_structure_ok,
         "Distance %": (
             round(distance_pct, 2)
             if distance_pct is not None
@@ -840,6 +975,35 @@ def scan_ticker_from_batch(ticker, batch_data):
 
         "Price OK": price_ok,
         "Volume OK": volume_ok,
+        "EMA Compression %": round(
+            ema_compression_pct, 2
+        ),
+        "20D High": round(
+            high_20, 2
+        ),
+
+        "20D Low": round(
+            low_20, 2
+        ),
+
+        "20D Range %": round(
+            range_20_pct, 2
+        ),
+
+        "20D Range Position %": round(
+            range_position_20, 2
+        ),
+        "20D Range OK": range_20_ok,
+        "20D EMA89 Crosses": int(
+            ema89_cross_count
+        ),
+
+        "20D EMA200 Crosses": int(
+            ema200_cross_count
+        ),
+
+        "20D EMA Cross Count": ema_cross_count_20d,
+        "Choppy Warning": choppy_warning,
     }
 
 def main():
@@ -1042,27 +1206,45 @@ def main():
             and row["Volume OK"]
         )
 
+        structure_ok = bool(
+            row["Daily Structure OK"]
+        )
+
+        four_hour_bullish = bool(
+            row["4H Bullish"]
+        )
+
+        range_ok = bool(
+            row["20D Range OK"]
+        )
+
+        choppy_warning = bool(
+            row["Choppy Warning"]
+        )
+
         if (
             has_daily_setup
             and basic_filters_ok
-            and row["4H Bullish"]
+            and structure_ok
+            and range_ok
+            and four_hour_bullish
+            and not choppy_warning
         ):
             return "QUALIFIED"
 
         if (
             has_daily_setup
             and basic_filters_ok
-            and not row["4H Bullish"]
         ):
             return "WATCH"
 
         return "NO SETUP"
 
+    # ACTUALLY CREATE THE STATUS COLUMN
     results_df["Status"] = results_df.apply(
         classify_stock,
         axis=1
     )
-
 
     # =========================================================
     # STEP 6: COLUMN ORDER
@@ -1072,6 +1254,7 @@ def main():
         "Ticker",
         "Status",
         "Signal",
+        "Daily Structure OK",
         "Days Ago",
         "Distance %",
         "Price",
@@ -1086,6 +1269,16 @@ def main():
         "EMA50 Slope %",
         "EMA89 Slope %",
         "EMA200 Slope %",
+        "EMA Compression %",
+        "20D High",
+        "20D Low",
+        "20D Range %",
+        "20D Range OK",
+        "20D Range Position %",
+        "20D EMA89 Crosses",
+        "20D EMA200 Crosses",
+        "20D EMA Cross Count",
+        "Choppy Warning",
         "4H Bullish",
         "4H Close",
         "4H EMA5",
