@@ -22,6 +22,8 @@ from config import (
     EMA_4H_FAST,
     EMA_4H_SLOW,
     PROGRESS_EVERY,
+    NEAR_ENTRY_MAX_PCT,
+    EXTENDED_MIN_PCT,
 )
 
 
@@ -240,6 +242,42 @@ def scan_ticker_from_batch(ticker, batch_data):
     current_volume = float(latest["Volume"])
     current_rsi = float(latest["RSI14"])
 
+    # =========================================================
+    # DAILY CANDLE STRENGTH
+    # =========================================================
+
+    daily_open = float(latest["Open"])
+    daily_high = float(latest["High"])
+    daily_low = float(latest["Low"])
+    daily_close = price
+
+    daily_bullish_candle = (
+        daily_close > daily_open
+    )
+
+    # Body size as % of opening price
+    daily_body_pct = (
+        abs(daily_close - daily_open)
+        / daily_open
+        * 100
+        if daily_open > 0
+        else None
+    )
+
+    # Where did price close inside today's entire candle?
+    # 0% = at the low
+    # 50% = middle
+    # 100% = at the high
+    daily_range = daily_high - daily_low
+
+    daily_close_position_pct = (
+        (daily_close - daily_low)
+        / daily_range
+        * 100
+        if daily_range > 0
+        else 50.0
+    )
+
     price_ok = price > MIN_PRICE
     volume_ok = avg_volume > MIN_AVG_VOLUME
 
@@ -415,6 +453,7 @@ def scan_ticker_from_batch(ticker, batch_data):
     rsi_change_since_reversal = None
     price_change_since_reversal_pct = None
     momentum_confirmation = None
+    entry_stage = None
 
     if days_ago is not None:
         reversal_row = df.iloc[-(days_ago + 1)]
@@ -452,6 +491,36 @@ def scan_ticker_from_batch(ticker, batch_data):
         else:
             momentum_confirmation = "MIXED"
 
+        # =====================================================
+        # ENTRY STAGE
+        # =====================================================
+
+        if momentum_confirmation == "EARLY":
+            entry_stage = "EARLY REVERSAL"
+
+        elif momentum_confirmation == "WEAKENING":
+            entry_stage = "LOSING MOMENTUM"
+
+        elif momentum_confirmation == "MIXED":
+            entry_stage = "MIXED"
+
+        elif momentum_confirmation == "CONFIRMED":
+
+            if (
+                price_change_since_reversal_pct
+                <= NEAR_ENTRY_MAX_PCT
+            ):
+                entry_stage = "CONFIRMED NEAR ENTRY"
+
+            elif (
+                price_change_since_reversal_pct
+                >= EXTENDED_MIN_PCT
+            ):
+                entry_stage = "EXTENDED"
+
+            else:
+                entry_stage = "CONFIRMED"
+
     return {
         "Ticker": ticker,
         "Signal": signal,
@@ -459,6 +528,19 @@ def scan_ticker_from_batch(ticker, batch_data):
         "Days Ago": days_ago,
         "Distance %": round(distance_pct, 2) if distance_pct is not None else None,
         "Price": round(price, 2),
+
+        "Daily Bullish Candle": daily_bullish_candle,
+
+        "Daily Body %": (
+            round(daily_body_pct, 2)
+            if daily_body_pct is not None
+            else None
+        ),
+
+        "Daily Close Position %": round(
+            daily_close_position_pct,
+            2
+        ),
 
         "EMA20": round(float(latest["EMA20"]), 2),
         "EMA50": round(float(latest["EMA50"]), 2),
@@ -503,7 +585,7 @@ def scan_ticker_from_batch(ticker, batch_data):
             else None
         ),
         "Momentum Confirmation": momentum_confirmation,
-
+        "Entry Stage": entry_stage,
         "Current Volume Ratio": (
             round(current_volume_ratio, 2)
             if current_volume_ratio is not None
@@ -672,6 +754,11 @@ def main():
         "Days Ago",
         "Distance %",
         "Price",
+
+        "Daily Bullish Candle",
+        "Daily Body %",
+        "Daily Close Position %",
+
         "EMA20",
         "EMA50",
         "EMA89",
@@ -698,6 +785,7 @@ def main():
         "RSI Change Since Reversal",
         "Price Change Since Reversal %",
         "Momentum Confirmation",
+        "Entry Stage",
         "Current Volume Ratio",
         "Reversal Volume Ratio",
         "4H Bullish",
