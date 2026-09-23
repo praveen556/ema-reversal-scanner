@@ -887,38 +887,6 @@ def update_database():
         f"{len(final_failed)}"
     )
 
-    print(
-        f"FN local file exists:     "
-        f"{fn_file.exists()}"
-    )
-
-    if fn_file.exists():
-
-        try:
-
-            fn_data = read_local_data(
-                "FN"
-            )
-
-            if fn_data is not None:
-
-                print(
-                    f"FN rows:                  "
-                    f"{len(fn_data)}"
-                )
-
-                print(
-                    f"FN latest date:           "
-                    f"{fn_data.index.max().date()}"
-                )
-
-        except Exception as exc:
-
-            print(
-                f"FN verification error: "
-                f"{exc}"
-            )
-
     print()
     print(
         f"Failed ticker report:"

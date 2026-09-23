@@ -40,8 +40,8 @@ DATA_FOLDER = "../data/daily"
 INITIAL_DAILY_PERIOD = "2y"
 
 # Yahoo download settings
-DAILY_BATCH_SIZE = 250
-DAILY_RETRY_BATCH_SIZE = 20
+DAILY_BATCH_SIZE = 350
+DAILY_RETRY_BATCH_SIZE = 50
 
 # Pauses help reduce Yahoo rate limiting
 DAILY_BATCH_PAUSE_SECONDS = 2
@@ -51,7 +51,7 @@ DAILY_RETRY_PAUSE_SECONDS = 10
 DAILY_MAX_RETRY_ROUNDS = 1
 
 # Future incremental updates will request only recent data
-UPDATE_LOOKBACK_DAYS = 10
+UPDATE_LOOKBACK_DAYS = 5
 
 
 # =========================================================
