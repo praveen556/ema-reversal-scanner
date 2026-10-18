@@ -27,6 +27,11 @@ STEPS = [
         "script": "track_setup_history_v2.py",
         "args": [],
     },
+    {
+        "name": "Filter for Daily 3 confirmations",
+        "script": "check_daily_3_confirmations.py",
+        "args": [],
+    },
 ]
 
 

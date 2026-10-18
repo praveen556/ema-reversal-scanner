@@ -1,4 +1,6 @@
 import time
+import json
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +14,8 @@ from config_v2 import (
     DAILY_RETRY_PAUSE_SECONDS,
     DAILY_MAX_RETRY_ROUNDS,
     UPDATE_LOOKBACK_DAYS,
+    UNAVAILABLE_FAILURE_THRESHOLD,
+    UNAVAILABLE_RECHECK_DAYS,
 )
 
 from scanner_v2 import get_stock_universe
@@ -32,6 +36,55 @@ DAILY_DATA_FOLDER.mkdir(
     parents=True,
     exist_ok=True,
 )
+
+OUTPUT_FOLDER = PROJECT_FOLDER / "output"
+OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+UNAVAILABLE_FILE = OUTPUT_FOLDER / "unavailable_tickers.txt"
+FAILURE_STATE_FILE = OUTPUT_FOLDER / "missing_ticker_failures.json"
+RECHECK_STATE_FILE = OUTPUT_FOLDER / "unavailable_recheck_state.json"
+
+
+def load_symbol_set(path):
+    if not path.exists():
+        return set()
+    return {line.strip().upper() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+
+
+def save_symbol_set(path, symbols):
+    path.write_text("".join(f"{ticker}\n" for ticker in sorted(symbols)), encoding="utf-8")
+
+
+def load_failure_state():
+    if not FAILURE_STATE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(FAILURE_STATE_FILE.read_text(encoding="utf-8"))
+        return {str(k).upper(): int(v) for k, v in raw.items()}
+    except Exception:
+        return {}
+
+
+def save_failure_state(state):
+    FAILURE_STATE_FILE.write_text(json.dumps(dict(sorted(state.items())), indent=2), encoding="utf-8")
+
+
+def recovery_check_due():
+    if not RECHECK_STATE_FILE.exists():
+        return True
+    try:
+        raw = json.loads(RECHECK_STATE_FILE.read_text(encoding="utf-8"))
+        last = date.fromisoformat(raw["last_recheck_date"])
+        return (date.today() - last).days >= UNAVAILABLE_RECHECK_DAYS
+    except Exception:
+        return True
+
+
+def mark_recovery_check_today():
+    RECHECK_STATE_FILE.write_text(
+        json.dumps({"last_recheck_date": date.today().isoformat()}, indent=2),
+        encoding="utf-8",
+    )
 
 
 # ============================================================
@@ -618,21 +671,32 @@ def update_database():
 
     existing_tickers = []
     missing_tickers = []
+    unavailable_tickers = load_symbol_set(UNAVAILABLE_FILE)
+    failure_counts = load_failure_state()
+    do_recovery_check = recovery_check_due()
+    recovery_tickers = []
+    skipped_unavailable = []
+
+    # Drop stale blacklist entries that are no longer in the current universe.
+    current_universe = set(tickers)
+    unavailable_tickers.intersection_update(current_universe)
+    failure_counts = {t: c for t, c in failure_counts.items() if t in current_universe}
 
     for ticker in tickers:
-
-        file_path = get_local_file(
-            ticker
-        )
+        file_path = get_local_file(ticker)
 
         if file_path.exists():
-            existing_tickers.append(
-                ticker
-            )
+            existing_tickers.append(ticker)
+            failure_counts.pop(ticker, None)
+            unavailable_tickers.discard(ticker)
+        elif ticker in unavailable_tickers:
+            if do_recovery_check:
+                recovery_tickers.append(ticker)
+                missing_tickers.append(ticker)
+            else:
+                skipped_unavailable.append(ticker)
         else:
-            missing_tickers.append(
-                ticker
-            )
+            missing_tickers.append(ticker)
 
     print()
     print("=" * 70)
@@ -645,9 +709,12 @@ def update_database():
     )
 
     print(
-        f"Missing local files:  "
+        f"Missing local files to check: "
         f"{len(missing_tickers)}"
     )
+    print(f"Skipped known unavailable:    {len(skipped_unavailable)}")
+    print(f"30-day recovery candidates:   {len(recovery_tickers)}")
+    print(f"30-day recovery check due:    {'YES' if do_recovery_check else 'NO'}")
 
     print("=" * 70)
 
@@ -805,6 +872,43 @@ def update_database():
             )
 
     # ========================================================
+    # PERSISTENT MISSING / UNAVAILABLE STATE
+    # ========================================================
+
+    missing_failed_set = set(missing_failed)
+    attempted_missing = set(missing_tickers)
+    recovered = attempted_missing - missing_failed_set
+
+    for ticker in recovered:
+        failure_counts.pop(ticker, None)
+        unavailable_tickers.discard(ticker)
+
+    for ticker in missing_failed_set:
+        if ticker in recovery_tickers:
+            # Already classified unavailable; keep it unavailable without
+            # inflating the consecutive-failure counter every 30 days.
+            unavailable_tickers.add(ticker)
+            continue
+        failure_counts[ticker] = failure_counts.get(ticker, 0) + 1
+        if failure_counts[ticker] >= UNAVAILABLE_FAILURE_THRESHOLD:
+            unavailable_tickers.add(ticker)
+
+    # Once unavailable, the counter is no longer needed for daily decisions.
+    for ticker in unavailable_tickers:
+        failure_counts.pop(ticker, None)
+
+    save_symbol_set(UNAVAILABLE_FILE, unavailable_tickers)
+    save_failure_state(failure_counts)
+
+    if do_recovery_check:
+        mark_recovery_check_today()
+
+    newly_unavailable = sorted(
+        ticker for ticker in missing_failed_set
+        if ticker in unavailable_tickers and ticker not in recovery_tickers
+    )
+
+    # ========================================================
     # FINAL FAILURE LIST
     # ========================================================
 
@@ -886,6 +990,13 @@ def update_database():
         f"Final failed this run:    "
         f"{len(final_failed)}"
     )
+
+    print(f"Known unavailable skipped: {len(skipped_unavailable)}")
+    print(f"Unavailable list total:    {len(unavailable_tickers)}")
+    print(f"Newly unavailable:         {len(newly_unavailable)}")
+    if do_recovery_check:
+        print(f"30-day recovery attempted: {len(recovery_tickers)}")
+        print(f"Recovered this check:      {len(set(recovery_tickers) - missing_failed_set)}")
 
     print()
     print(

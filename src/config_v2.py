@@ -53,6 +53,11 @@ DAILY_MAX_RETRY_ROUNDS = 1
 # Future incremental updates will request only recent data
 UPDATE_LOOKBACK_DAYS = 5
 
+# Persistent missing-ticker handling. A ticker is skipped after this many
+# consecutive failed daily runs, then given one recovery attempt every N days.
+UNAVAILABLE_FAILURE_THRESHOLD = 3
+UNAVAILABLE_RECHECK_DAYS = 30
+
 
 # =========================================================
 # BASIC FILTERS
