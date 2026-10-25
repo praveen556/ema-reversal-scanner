@@ -825,30 +825,11 @@ def load_daily_data_from_local(tickers):
 
 
 def download_hourly_batch(tickers):
-    """Download 1H data only for Daily reversal candidates."""
+    """Incrementally update persistent 1H candidate history and use local data."""
     if not tickers:
         return None
-
-    print()
-    print(f"Downloading 1H data for {len(tickers)} Daily candidates...")
-
-    data = yf.download(
-        tickers=tickers,
-        period="60d",
-        interval="1h",
-        auto_adjust=False,
-        progress=False,
-        prepost=False,
-        group_by="ticker",
-        threads=True,
-    )
-
-    if data.empty:
-        print("WARNING: No 1H data downloaded.")
-        return None
-
-    print("1H batch download completed.")
-    return data
+    from hourly_data_store import update_candidates
+    return update_candidates(tickers)
 
 
 def get_4h_momentum_from_batch(ticker, hourly_batch):
@@ -865,7 +846,7 @@ def get_4h_momentum_from_batch(ticker, hourly_batch):
     try:
         hourly = hourly_batch[ticker].copy()
     except KeyError:
-        print(f"WARNING: No 1H batch data for {ticker}")
+        print(f"WARNING: No local 1H data for {ticker}")
         return False, None, None, None
 
     hourly = hourly.dropna(
