@@ -10,6 +10,8 @@ Your OAuth token is reused from <project>/.schwab_auth/token.json.
 
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, time as clock_time
 from multiprocessing import freeze_support
 from pathlib import Path
@@ -25,12 +27,19 @@ OUTPUT_DIR = PROJECT_ROOT / 'data' / '5min'
 TOKEN_PATH = PROJECT_ROOT / '.schwab_auth' / 'token.json'
 CALLBACK_URL = 'https://127.0.0.1:8182'  # Must exactly match Schwab app registration
 
-TOP_N = 700
-INITIAL_LOOKBACK_DAYS = 180   # Calendar days; change to 240 if desired
-CHUNK_DAYS = 25               # Keep requests in modest date windows
+TOP_N = 7040
+WORKERS = 3
+BATCH_SIZE = 100
+# Shared request pacing across workers; adjust only after monitoring HTTP 429s.
+MIN_SECONDS_BETWEEN_REQUESTS = 0.7
+_rate_lock = threading.Lock()
+_next_request_at = 0.0
+_stop = threading.Event()
+
+INITIAL_LOOKBACK_DAYS = 270   # Calendar days; change to 240 if desired
+CHUNK_DAYS = 270               # Keep requests in modest date windows
 OVERLAP_DAYS = 2              # Refresh latest existing candles on repeat runs
 SKIP_UP_TO_DATE = True        # Skip files current through the latest expected completed 5-min bar
-REQUEST_DELAY_SECONDS = 0.7
 MAX_ATTEMPTS = 4
 ET = ZoneInfo('America/New_York')
 UTC = ZoneInfo('UTC')
@@ -91,9 +100,21 @@ def normalize_candles(candles):
     return df[COLUMNS].copy()
 
 
+def throttle():
+    global _next_request_at
+    with _rate_lock:
+        delay = max(0, _next_request_at - time.monotonic())
+        if delay:
+            time.sleep(delay)
+        _next_request_at = time.monotonic() + MIN_SECONDS_BETWEEN_REQUESTS
+
+
 def fetch_window(client, ticker, start, end):
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if _stop.is_set():
+            raise RuntimeError("Stopped after authentication failure")
         try:
+            throttle()
             response = client.get_price_history_every_five_minutes(
                 ticker,
                 start_datetime=start,
@@ -111,8 +132,8 @@ def fetch_window(client, ticker, start, end):
             if body.get('error'):
                 raise RuntimeError(str(body['error']))
             return normalize_candles(body.get('candles', []))
-        except Exception:
-            if attempt >= MAX_ATTEMPTS:
+        except Exception as exc:
+            if is_auth_error(exc) or attempt >= MAX_ATTEMPTS:
                 raise
             time.sleep(min(30, 2 ** attempt))
     return pd.DataFrame(columns=COLUMNS)
@@ -163,7 +184,6 @@ def download_ticker(client, ticker, now):
             pieces.append(batch)
             fetched += len(batch)
         cursor = end
-        time.sleep(REQUEST_DELAY_SECONDS)
 
     combined = pd.concat(pieces, ignore_index=True)
     if combined.empty:
@@ -181,33 +201,71 @@ def download_ticker(client, ticker, now):
     return len(combined), fetched, 'UPDATED' if not existing.empty else 'CREATED'
 
 
+def is_auth_error(exc):
+    """Identify Schwab OAuth failures without mistaking data errors for auth."""
+    message = str(exc).lower()
+    response = getattr(exc, 'response', None)
+    status = getattr(response, 'status_code', None)
+    return status == 401 or any(term in message for term in (
+        'token_invalid', 'invalid_token', 'token_expired',
+        'invalid_grant', 'unauthorized', '401 client error',
+    ))
+
+
+def run_one(client, ticker, now):
+    if _stop.is_set():
+        return ticker, 0, 0, 'CANCELLED', None
+    try:
+        total, fetched, status = download_ticker(client, ticker, now)
+        return ticker, total, fetched, status, None
+    except Exception as exc:
+        if is_auth_error(exc):
+            _stop.set()
+        return ticker, 0, 0, 'ERROR', exc
+
+
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     tickers = read_tickers()
     if not tickers:
         raise RuntimeError('No tickers found in Top20 Combined sheet')
-    print(f'Found {len(tickers)} tickers: {", ".join(tickers)}', flush=True)
-    print('Connecting to Schwab using existing OAuth token...', flush=True)
+    print(f'{len(tickers)} tickers; {WORKERS} workers; batches of {BATCH_SIZE}', flush=True)
+    print('Using shared Schwab client and one shared API rate limiter.', flush=True)
     client = authenticate()
     now = datetime.now(ET)
-    successes = 0
-    skipped = 0
+    successes = skipped = 0
     failures = []
-    for i, ticker in enumerate(tickers, 1):
-        print(f'[{i}/{len(tickers)}] {ticker}...', flush=True)
-        try:
-            total, fetched, status = download_ticker(client, ticker, now)
-            print(f'  {status}: {total:,} stored candles ({fetched:,} downloaded this run)', flush=True)
-            if status.startswith("SKIPPED"):
-                skipped += 1
-            else:
-                successes += 1
-        except Exception as exc:
-            print(f'  ERROR {ticker}: {exc}', flush=True)
-            failures.append(ticker)
-    print(f'Finished: {successes} processed, {skipped} skipped, {len(failures)} failed. Files: {OUTPUT_DIR}', flush=True)
+    for offset in range(0, len(tickers), BATCH_SIZE):
+        if _stop.is_set():
+            break
+        batch = tickers[offset:offset+BATCH_SIZE]
+        print(f'Batch {offset//BATCH_SIZE + 1}: tickers {offset+1}-{offset+len(batch)}', flush=True)
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+            futures = {executor.submit(run_one, client, ticker, now): ticker for ticker in batch}
+            for future in as_completed(futures):
+                ticker, total, fetched, status, exc = future.result()
+                if exc is not None:
+                    failures.append(ticker)
+                    print(f'  ERROR {ticker}: {exc}', flush=True)
+                    if is_auth_error(exc):
+                        print('  AUTH ERROR: stopping. Existing CSVs preserved. Check token authorization.', flush=True)
+                elif status == 'CANCELLED':
+                    pass
+                else:
+                    print(f'  {ticker}: {status}, {total:,} stored, {fetched:,} fetched', flush=True)
+                    if status.startswith('SKIPPED'):
+                        skipped += 1
+                    else:
+                        successes += 1
+        print(f'Progress: {min(offset+BATCH_SIZE,len(tickers))}/{len(tickers)}; '
+              f'processed={successes}, skipped={skipped}, failed={len(failures)}', flush=True)
+    print(f'Finished: processed={successes}, skipped={skipped}, failed={len(failures)}. '
+          f'Output: {OUTPUT_DIR}', flush=True)
     if failures:
-        print('Failed tickers (retry later): ' + ', '.join(failures), flush=True)
+        print('Failed tickers: ' + ', '.join(failures), flush=True)
+    if _stop.is_set():
+        print('Authentication failure detected. Run your Schwab auth test/reauthorization '
+              'and restart; existing files will be skipped if up to date.', flush=True)
 
 
 if __name__ == '__main__':
