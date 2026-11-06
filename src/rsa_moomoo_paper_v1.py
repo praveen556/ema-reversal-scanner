@@ -34,8 +34,12 @@ def log(event,ticker='',detail=''):
     logging.info('%s %s %s',event,ticker,detail)
 
 def state_load():
-    if not STATE_FILE.exists():return {'orders':{},'entries':{},'last_signal_day':'','trading_date':''}
-    return json.loads(STATE_FILE.read_text())
+    if not STATE_FILE.exists():return {'orders':{},'entries':{},'dry_positions':{},'last_signal_day':'','trading_date':''}
+    s=json.loads(STATE_FILE.read_text())
+    s.setdefault('orders',{})
+    s.setdefault('entries',{})
+    s.setdefault('dry_positions',{})
+    return s
 def state_save(s):
     tmp=STATE_FILE.with_suffix('.tmp');tmp.write_text(json.dumps(s,indent=2,default=str));os.replace(tmp,STATE_FILE)
 
@@ -174,6 +178,12 @@ def main():
         allowed=accounts[(accounts.acc_id.astype(str)==str(account)) & (accounts.trd_env.astype(str).str.upper().str.contains('SIMULATE'))]
         if allowed.empty:raise RuntimeError('Configured account is not a verified SIMULATE account')
         log('START',detail=f'PAPER_ONLY enable_orders={ENABLE_PAPER_ORDERS}, candidates={len(candidates)}')
+        if not ENABLE_PAPER_ORDERS:
+            old=[k for k,v in s['orders'].items()
+                 if v.get('status')=='DRY_RUN' and k.endswith(':BUY')
+                 and k.split(':')[1] not in s['dry_positions']]
+            if old:
+                log('LEGACY_DRY_RUN_UNTRACKED',detail=f'{len(old)} earlier BUY intents cannot be safely reconstructed as fills; new dry-run signals will be tracked')
         today=str(now().date())
         # Entry and trend-exit actions are intentionally limited to opening window.
         # After the opening window, continue stop monitoring until market close.
@@ -182,13 +192,22 @@ def main():
             if clock<dtime(9,31):time.sleep(15);continue
             if clock>=dtime(16,0):break
             try:
-                positions=get_positions(trade,account);pending=get_pending(trade,account)
+                if ENABLE_PAPER_ORDERS:
+                    positions=get_positions(trade,account)
+                    pending=get_pending(trade,account)
+                else:
+                    positions={t:{'qty':int(v['qty']),'cost':float(v['entry_price'])}
+                               for t,v in s['dry_positions'].items()}
+                    pending=set()
+
                 # Exits first. EMA20 trend signals use two completed prior-session closes.
+                # DRY_RUN tracks independent virtual positions; no broker orders are placed.
                 for ticker,pos in positions.items():
                     if ticker in pending:continue
                     d=cache.get(ticker)
                     if d is None or len(d)<3:continue
-                    ent=s['entries'].get(ticker)
+                    ent=(s['entries'].get(ticker) if ENABLE_PAPER_ORDERS
+                         else s['dry_positions'].get(ticker))
                     if ent is None:
                         log('UNTRACKED_POSITION',ticker,'No locally confirmed entry; skip automated exits');continue
                     atr=float(ent['atr']);entry=float(ent['entry_price'])
@@ -204,11 +223,22 @@ def main():
                     if reason:
                         last=snapshot(quote,ticker)
                         limit=max(.01,round(last*(1-MAX_SELL_LIMIT_DISCOUNT),2))
-                        submit(trade,account,'SELL',ticker,pos['qty'],limit,reason,s)
+                        if ENABLE_PAPER_ORDERS:
+                            submit(trade,account,'SELL',ticker,pos['qty'],limit,reason,s)
+                        else:
+                            key=f'{today}:{ticker}:SELL'
+                            if key not in s['orders']:
+                                s['orders'][key]={'status':'DRY_RUN_EXIT','reason':reason,
+                                                  'time':now().isoformat(),'price':last,
+                                                  'qty':pos['qty']}
+                                log('DRY_EXIT_SIGNAL',ticker,
+                                    f'{reason} qty={pos["qty"]} observed={last:.2f} stop={stop:.2f}')
+                                del s['dry_positions'][ticker]
+                                state_save(s)
                 if dtime(9,31)<=clock<dtime(9,45):
                     for ticker,score,atr in candidates:
                         if len(positions)+len(pending)>=MAX_POSITIONS:break
-                        if ticker in positions or ticker in pending or ticker in s['entries']:continue
+                        if ticker in positions or ticker in pending or ticker in s['entries'] or ticker in s['dry_positions']:continue
                         if f'{today}:{ticker}:BUY' in s['orders']:continue
                         last=snapshot(quote,ticker)
                         qty=math.floor(DOLLARS_PER_TRADE/(last*(1+MAX_BUY_LIMIT_PREMIUM)))
@@ -218,10 +248,25 @@ def main():
                         # For now, limit aggregate notional to configured paper budget.
                         existing=sum(v['qty']*v['cost'] for v in positions.values())
                         if existing+qty*limit>CAPITAL_ASSUMED:continue
-                        if submit(trade,account,'BUY',ticker,qty,limit,'RSA_DAILY_ENTRY',s):
-                            pending.add(ticker)
+                        if ENABLE_PAPER_ORDERS:
+                            if submit(trade,account,'BUY',ticker,qty,limit,'RSA_DAILY_ENTRY',s):
+                                pending.add(ticker)
+                        else:
+                            key=f'{today}:{ticker}:BUY'
+                            if key in s['orders']:
+                                continue
+                            # Simulation assumption: fill at observed snapshot, not proof of an executable fill.
+                            s['orders'][key]={'status':'DRY_RUN','reason':'RSA_DAILY_ENTRY',
+                                              'time':now().isoformat(),'price':last,'qty':qty}
+                            s['dry_positions'][ticker]={'entry_date':today,'entry_price':last,
+                                                         'atr':atr,'qty':qty}
+                            state_save(s)
+                            log('DRY_ENTRY_SIGNAL',ticker,
+                                f'qty={qty} assumed_fill={last:.2f} atr={atr:.4f} '
+                                f'stop={last-ATR_MULT*atr:.2f}')
+                            positions[ticker]={'qty':qty,'cost':last}
                 # Reconcile actual filled buys. Do not assume submitted == filled.
-                latest=get_positions(trade,account)
+                latest=get_positions(trade,account) if ENABLE_PAPER_ORDERS else {}
                 for ticker,pos in latest.items():
                     if ticker in s['entries']:continue
                     key=f'{today}:{ticker}:BUY'
@@ -231,7 +276,7 @@ def main():
                             s['entries'][ticker]={'entry_date':today,'entry_price':pos['cost'],'atr':atr}
                             state_save(s);log('ENTRY_CONFIRMED',ticker,str(s['entries'][ticker]))
                 # On a fully closed position, remove tracked entry so future signals can re-enter.
-                for ticker in list(s['entries']):
+                for ticker in list(s['entries']) if ENABLE_PAPER_ORDERS else []:
                     if ticker not in latest and f'{today}:{ticker}:SELL' in s['orders']:
                         del s['entries'][ticker];state_save(s);log('EXIT_CONFIRMED',ticker)
             except Exception as e:
