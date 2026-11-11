@@ -1,4 +1,4 @@
-"""RSA DAILY + EMA20 Moomoo PAPER bot. Run 08:45-16:10 America/New_York on trading days.
+"""RSA DAILY + EMA20 Moomoo DRY-RUN V3 bot. Run 08:45-16:10 America/New_York on trading days.
 Dependencies: pip install moomoo-api pandas numpy. OpenD must run on 127.0.0.1:11111.
 IMPORTANT: Paper only; no live order pathway. Read README before use.
 """
@@ -20,7 +20,7 @@ CAPITAL_ASSUMED=15000.0; DOLLARS_PER_TRADE=500.0; MAX_POSITIONS=30
 ATR_MULT=1.5; MAX_HOLD_SESSIONS=60; MIN_PRICE=30; MIN_AVG_VOL=1_000_000; MIN_AVG_DOLLAR=100_000_000
 RS_THRESHOLD=0.03; POLL_SECONDS=60; MAX_BUY_LIMIT_PREMIUM=0.003; MAX_SELL_LIMIT_DISCOUNT=0.003
 # Prevent unattended orders until you have checked account ID, data freshness and order handling.
-ENABLE_PAPER_ORDERS=False
+ENABLE_PAPER_ORDERS=False  # V2 is DRY-RUN ONLY; broker submission is disabled
 PAPER_ACCOUNT_ID=1397202  # Set this to the paper account ID returned by get_acc_list().
 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
@@ -39,6 +39,8 @@ def state_load():
     s.setdefault('orders',{})
     s.setdefault('entries',{})
     s.setdefault('dry_positions',{})
+    s.setdefault('last_signal_day','')
+    s.setdefault('trading_date','')
     return s
 def state_save(s):
     tmp=STATE_FILE.with_suffix('.tmp');tmp.write_text(json.dumps(s,indent=2,default=str));os.replace(tmp,STATE_FILE)
@@ -77,13 +79,15 @@ def paths():
 def candidates_and_indicators():
     pths=paths()
     if 'SPY' not in pths:raise RuntimeError('SPY.csv is required for relative strength')
-    spy=add_indicators(load_daily(pths['SPY']))
+    spy_raw=load_daily(pths['SPY'])
+    if spy_raw is None:raise RuntimeError('Invalid or insufficient SPY daily data')
+    spy=add_indicators(spy_raw)
     # Previous session: use SPY last completed date; never use a current-day partial daily candle.
     cutoff=pd.Timestamp(now().date())-pd.Timedelta(days=1)
     spy=spy.loc[:cutoff]
     if len(spy)<75:raise RuntimeError('Insufficient SPY history')
     signal_day=spy.index[-1]
-    if (pd.Timestamp(now().date())-signal_day).days>4:raise RuntimeError(f'Stale SPY daily data: {signal_day.date()}')
+    # Freshness is checked separately for NEW entries; stale data must not disable stop monitoring.
     spyret=spy.close/spy.close.shift(20)-1
     found=[]; indicator_cache={};bad=0
     for t,p in pths.items():
@@ -138,151 +142,187 @@ def snapshot(quote,ticker):
     # Quotes may be delayed. Verify subscription/quote permissions before enabling orders.
     return price
 
-def submit(trade,account,side,ticker,qty,price,reason,s):
-    key=f'{now().date()}:{ticker}:{side}'
+
+# V3 retains the existing state.json and events.csv paths. Do not run older versions simultaneously.
+# A paper position is an assumed snapshot fill; no actual orders are submitted.
+# Stop triggers use snapshot LAST price, not an exchange-native stop order.
+# Delayed quotes and prices moving between polls can cause missed triggers.
+HEARTBEAT_SECONDS=300
+MAX_SNAPSHOT_AGE_SECONDS=180
+
+def previous_weekday(day):
+    # Weekend-aware, not a full exchange holiday calendar. On holidays, fail closed on new entries.
+    d=day-timedelta(days=1)
+    while d.weekday()>=5:d-=timedelta(days=1)
+    return d
+
+def quote_info(quote,ticker):
+    df=must_ok(quote.get_market_snapshot([f'US.{ticker}']),'get_market_snapshot')
+    if df.empty:raise RuntimeError('Empty snapshot')
+    r=df.iloc[0]
+    price=float(r.get('last_price',0))
+    if not math.isfinite(price) or price<=0:raise RuntimeError(f'Invalid snapshot price: {price}')
+    # Some Moomoo snapshots have update_time (HH:MM:SS) but no date. Do not
+    # pretend to validate freshness without a reliable date+time pair.
+    update_time=str(r.get('update_time',''))
+    update_date=str(r.get('update_date',''))
+    if update_date and update_time and update_date.lower()!='nan' and update_time.lower()!='nan':
+        try:
+            stamp=pd.Timestamp(update_date+' '+update_time)
+            if stamp.tzinfo is None:stamp=stamp.tz_localize(TZ)
+            else:stamp=stamp.tz_convert(TZ)
+            age=(now()-stamp.to_pydatetime()).total_seconds()
+            if age>MAX_SNAPSHOT_AGE_SECONDS or age < -120:
+                raise RuntimeError(f'Stale/future quote: age_seconds={age:.0f}')
+        except (ValueError,TypeError) as e:
+            raise RuntimeError(f'Cannot parse quote timestamp: {e}') from e
+    return price,update_date,update_time
+
+def position_stop(p):
+    return float(p['entry_price'])-ATR_MULT*float(p['atr'])
+
+def emit_exit(s,ticker,p,reason,observed):
+    today=now().date().isoformat()
+    key=f'{today}:{ticker}:SELL'
     if key in s['orders']:
-        log('DUPLICATE_BLOCK',ticker,key);return False
-    # Write reservation BEFORE network request. If request times out, manually reconcile broker orders.
-    s['orders'][key]={'status':'RESERVED','reason':reason,'time':now().isoformat()};state_save(s)
-    log('ORDER_INTENT',ticker,f'{side} {qty} @ {price:.2f} {reason}')
-    if not ENABLE_PAPER_ORDERS:
-        s['orders'][key]['status']='DRY_RUN';state_save(s);return False
-    try:
-        result=trade.place_order(price=round(price,2),qty=qty,code=f'US.{ticker}',
-            trd_side=TrdSide.BUY if side=='BUY' else TrdSide.SELL,
-            order_type=OrderType.NORMAL,trd_env=TrdEnv.SIMULATE,acc_id=account)
-        df=must_ok(result,'place_order')
-        s['orders'][key]['status']='SUBMITTED';s['orders'][key]['broker_result']=str(df.to_dict('records'))[:1200]
-        state_save(s);log('ORDER_SUBMITTED',ticker,side)
-        return True
-    except Exception as e:
-        s['orders'][key]['status']='UNKNOWN_RECONCILE';state_save(s)
-        log('ORDER_UNKNOWN_RECONCILE',ticker,str(e));return False
+        log('DUPLICATE_EXIT_BLOCK',ticker,key)
+        return
+    qty=int(p['qty']);entry=float(p['entry_price']);stop=position_stop(p)
+    pnl=(observed-entry)*qty
+    # Record exit and remove position in one atomic state update.
+    s['orders'][key]={'status':'DRY_RUN_EXIT','reason':reason,
+        'time':now().isoformat(),'price':observed,'qty':qty,
+        'entry_price':entry,'stop':stop,'estimated_pnl':round(pnl,2)}
+    del s['dry_positions'][ticker]
+    state_save(s)
+    log('DRY_EXIT_SIGNAL',ticker,
+        f'{reason} qty={qty} entry={entry:.4f} observed_exit={observed:.4f} '
+        f'stop={stop:.4f} estimated_pnl={pnl:.2f}')
+
+def monitor_one(s,quote,ticker,p,cache,clock):
+    stop=position_stop(p)
+    # Snapshot first: stop monitoring remains active throughout market hours.
+    price,update_date,update_time=quote_info(quote,ticker)
+    p['last_price']=price
+    p['last_checked']=now().isoformat()
+    p['stop_price']=stop
+    p['quote_update_date']=update_date
+    p['quote_update_time']=update_time
+    if price<=stop:
+        log('DRY_STOP_TRIGGER',ticker,f'last={price:.4f} stop={stop:.4f}')
+        emit_exit(s,ticker,p,f'STOP_TRIGGER_{stop:.2f}',price)
+        return
+
+    # Evaluate completed DAILY bars once per date, at ANY time after startup.
+    # Missing/stale data must not generate a trend/time exit.
+    today=now().date().isoformat()
+    if p.get('last_daily_exit_check_day')==today:
+        return
+    d=cache.get(ticker)
+    if d is None or len(d)<3:
+        log('DAILY_EXIT_DATA_UNAVAILABLE',ticker,'No sufficient cached daily bars')
+        p['last_daily_exit_check_day']=today
+        return
+    last_bar=d.index[-1].date()
+    expected=previous_weekday(now().date())
+    if last_bar!=expected:
+        log('DAILY_EXIT_DATA_STALE',ticker,
+            f'last_bar={last_bar} expected={expected}; no EMA/time exit')
+        p['last_daily_exit_check_day']=today
+        return
+
+    entry_date=pd.Timestamp(p['entry_date'])
+    # Never count bars preceding the entry or its opening day.
+    completed=d.loc[d.index>entry_date]
+    sessions=len(completed)
+    below=False
+    if sessions>=2:
+        last_two=completed.iloc[-2:]
+        below=bool((last_two['close']<last_two['ema20']).all())
+    else:
+        last_two=completed.iloc[-2:]
+    details=(f'completed_sessions={sessions} last_bar={last_bar} '
+             f'last_two_close_ema20='+','.join(
+                 f'{float(r.close):.4f}/{float(r.ema20):.4f}'
+                 for _,r in last_two.iterrows())+
+             f' below_two={below} max_hold={MAX_HOLD_SESSIONS}')
+    log('DAILY_EXIT_CHECK',ticker,details)
+    p['last_daily_exit_check_day']=today
+    if below:
+        emit_exit(s,ticker,p,'EMA20_TWO_CLOSES',price)
+    elif sessions>=MAX_HOLD_SESSIONS:
+        emit_exit(s,ticker,p,'MAX_HOLD_60',price)
 
 def main():
+    if ENABLE_PAPER_ORDERS:
+        raise RuntimeError('V3 is dry-run only. Keep ENABLE_PAPER_ORDERS=False.')
     if not DAILY_DIR.exists():raise FileNotFoundError(DAILY_DIR)
-    if now().weekday()>=5:raise RuntimeError('Run on a US trading day (holiday calendar not included)')
+    if now().weekday()>=5:raise RuntimeError('Run on a trading weekday')
     s=state_load()
-    signal_day,candidates,cache=candidates_and_indicators()
-    if s.get('last_signal_day')!=str(signal_day.date()):
-        s['last_signal_day']=str(signal_day.date());state_save(s)
-    quote=OpenQuoteContext(host=HOST,port=PORT)
-    trade=OpenSecTradeContext(host=HOST,port=PORT,filter_trdmarket=TrdMarket.US)
+    quote=None
     try:
-        accounts=must_ok(trade.get_acc_list(),'get_acc_list')
-        log('ACCOUNTS',detail=str(accounts[['acc_id','trd_env']].to_dict('records')) if {'acc_id','trd_env'}.issubset(accounts.columns) else str(accounts))
-        if PAPER_ACCOUNT_ID is None:
-            log('SETUP_REQUIRED',detail='Set PAPER_ACCOUNT_ID to your SIMULATE account; no orders will be sent')
-            return
-        account=PAPER_ACCOUNT_ID
-        allowed=accounts[(accounts.acc_id.astype(str)==str(account)) & (accounts.trd_env.astype(str).str.upper().str.contains('SIMULATE'))]
-        if allowed.empty:raise RuntimeError('Configured account is not a verified SIMULATE account')
-        log('START',detail=f'PAPER_ONLY enable_orders={ENABLE_PAPER_ORDERS}, candidates={len(candidates)}')
-        if not ENABLE_PAPER_ORDERS:
-            old=[k for k,v in s['orders'].items()
-                 if v.get('status')=='DRY_RUN' and k.endswith(':BUY')
-                 and k.split(':')[1] not in s['dry_positions']]
-            if old:
-                log('LEGACY_DRY_RUN_UNTRACKED',detail=f'{len(old)} earlier BUY intents cannot be safely reconstructed as fills; new dry-run signals will be tracked')
-        today=str(now().date())
-        # Entry and trend-exit actions are intentionally limited to opening window.
-        # After the opening window, continue stop monitoring until market close.
-        while now().time()<dtime(16,10):
+        # Scan failures must NOT prevent monitoring existing virtual positions.
+        candidates=[];cache={};signal_day=None;fresh=False
+        try:
+            signal_day,candidates,cache=candidates_and_indicators()
+            fresh=(signal_day.date()==previous_weekday(now().date()))
+            if not fresh:
+                log('STALE_SIGNALS_ENTRY_BLOCK',detail=
+                    f'signal_day={signal_day.date()} expected={previous_weekday(now().date())}')
+            s['last_signal_day']=str(signal_day.date());state_save(s)
+        except Exception as e:
+            log('SCAN_ERROR_ENTRIES_DISABLED',detail=str(e)[:300])
+        quote=OpenQuoteContext(host=HOST,port=PORT)
+        log('START',detail=f'DRY_RUN_ONLY candidates={len(candidates)} fresh={fresh} '
+            f'carried_positions={len(s["dry_positions"])}')
+        last_heartbeat=0.0
+        while now().time()<dtime(16,0):
             clock=now().time()
             if clock<dtime(9,31):time.sleep(15);continue
-            if clock>=dtime(16,0):break
-            try:
-                if ENABLE_PAPER_ORDERS:
-                    positions=get_positions(trade,account)
-                    pending=get_pending(trade,account)
-                else:
-                    positions={t:{'qty':int(v['qty']),'cost':float(v['entry_price'])}
-                               for t,v in s['dry_positions'].items()}
-                    pending=set()
-
-                # Exits first. EMA20 trend signals use two completed prior-session closes.
-                # DRY_RUN tracks independent virtual positions; no broker orders are placed.
-                for ticker,pos in positions.items():
-                    if ticker in pending:continue
-                    d=cache.get(ticker)
-                    if d is None or len(d)<3:continue
-                    ent=(s['entries'].get(ticker) if ENABLE_PAPER_ORDERS
-                         else s['dry_positions'].get(ticker))
-                    if ent is None:
-                        log('UNTRACKED_POSITION',ticker,'No locally confirmed entry; skip automated exits');continue
-                    atr=float(ent['atr']);entry=float(ent['entry_price'])
-                    stop=entry-ATR_MULT*atr
-                    close_below=(d.close.iloc[-1]<d.ema20.iloc[-1] and d.close.iloc[-2]<d.ema20.iloc[-2])
-                    sessions=int((d.index>=pd.Timestamp(ent['entry_date'])).sum())
-                    reason=None
-                    if close_below and clock<dtime(9,45):reason='EMA20_TWO_CLOSES'
-                    elif sessions>=MAX_HOLD_SESSIONS and clock<dtime(9,45):reason='MAX_HOLD_60'
-                    else:
-                        last=snapshot(quote,ticker)
-                        if last<=stop:reason=f'STOP_TRIGGER_{stop:.2f}'
-                    if reason:
-                        last=snapshot(quote,ticker)
-                        limit=max(.01,round(last*(1-MAX_SELL_LIMIT_DISCOUNT),2))
-                        if ENABLE_PAPER_ORDERS:
-                            submit(trade,account,'SELL',ticker,pos['qty'],limit,reason,s)
-                        else:
-                            key=f'{today}:{ticker}:SELL'
-                            if key not in s['orders']:
-                                s['orders'][key]={'status':'DRY_RUN_EXIT','reason':reason,
-                                                  'time':now().isoformat(),'price':last,
-                                                  'qty':pos['qty']}
-                                log('DRY_EXIT_SIGNAL',ticker,
-                                    f'{reason} qty={pos["qty"]} observed={last:.2f} stop={stop:.2f}')
-                                del s['dry_positions'][ticker]
-                                state_save(s)
-                if dtime(9,31)<=clock<dtime(9,45):
-                    for ticker,score,atr in candidates:
-                        if len(positions)+len(pending)>=MAX_POSITIONS:break
-                        if ticker in positions or ticker in pending or ticker in s['entries'] or ticker in s['dry_positions']:continue
-                        if f'{today}:{ticker}:BUY' in s['orders']:continue
-                        last=snapshot(quote,ticker)
-                        qty=math.floor(DOLLARS_PER_TRADE/(last*(1+MAX_BUY_LIMIT_PREMIUM)))
+            # Always check existing positions, even if scan data is stale or missing.
+            for ticker in list(s['dry_positions']):
+                try:
+                    monitor_one(s,quote,ticker,s['dry_positions'][ticker],cache,clock)
+                except Exception as e:
+                    log('POSITION_CHECK_ERROR',ticker,str(e)[:300])
+            state_save(s)
+            if time.monotonic()-last_heartbeat>=HEARTBEAT_SECONDS:
+                for ticker,p in s['dry_positions'].items():
+                    log('POSITION_HEARTBEAT',ticker,
+                        f'entry={float(p["entry_price"]):.4f} stop={position_stop(p):.4f} '
+                        f'last={p.get("last_price","UNKNOWN")} '
+                        f'checked={p.get("last_checked","NEVER")}')
+                last_heartbeat=time.monotonic()
+            # New entries only in the opening window with previous-session data.
+            if fresh and dtime(9,31)<=clock<dtime(9,45):
+                for ticker,score,atr in candidates:
+                    try:
+                        if len(s['dry_positions'])>=MAX_POSITIONS:break
+                        if ticker in s['dry_positions'] or ticker in s['entries']:continue
+                        today=now().date().isoformat();key=f'{today}:{ticker}:BUY'
+                        if key in s['orders']:continue
+                        price,qd,qt=quote_info(quote,ticker)
+                        qty=math.floor(DOLLARS_PER_TRADE/(price*(1+MAX_BUY_LIMIT_PREMIUM)))
                         if qty<1:continue
-                        limit=round(last*(1+MAX_BUY_LIMIT_PREMIUM),2)
-                        # Capital checks must use actual buying power before enabling orders.
-                        # For now, limit aggregate notional to configured paper budget.
-                        existing=sum(v['qty']*v['cost'] for v in positions.values())
-                        if existing+qty*limit>CAPITAL_ASSUMED:continue
-                        if ENABLE_PAPER_ORDERS:
-                            if submit(trade,account,'BUY',ticker,qty,limit,'RSA_DAILY_ENTRY',s):
-                                pending.add(ticker)
-                        else:
-                            key=f'{today}:{ticker}:BUY'
-                            if key in s['orders']:
-                                continue
-                            # Simulation assumption: fill at observed snapshot, not proof of an executable fill.
-                            s['orders'][key]={'status':'DRY_RUN','reason':'RSA_DAILY_ENTRY',
-                                              'time':now().isoformat(),'price':last,'qty':qty}
-                            s['dry_positions'][ticker]={'entry_date':today,'entry_price':last,
-                                                         'atr':atr,'qty':qty}
-                            state_save(s)
-                            log('DRY_ENTRY_SIGNAL',ticker,
-                                f'qty={qty} assumed_fill={last:.2f} atr={atr:.4f} '
-                                f'stop={last-ATR_MULT*atr:.2f}')
-                            positions[ticker]={'qty':qty,'cost':last}
-                # Reconcile actual filled buys. Do not assume submitted == filled.
-                latest=get_positions(trade,account) if ENABLE_PAPER_ORDERS else {}
-                for ticker,pos in latest.items():
-                    if ticker in s['entries']:continue
-                    key=f'{today}:{ticker}:BUY'
-                    if s['orders'].get(key,{}).get('status')=='SUBMITTED':
-                        atr=next((a for t,_,a in candidates if t==ticker),None)
-                        if atr:
-                            s['entries'][ticker]={'entry_date':today,'entry_price':pos['cost'],'atr':atr}
-                            state_save(s);log('ENTRY_CONFIRMED',ticker,str(s['entries'][ticker]))
-                # On a fully closed position, remove tracked entry so future signals can re-enter.
-                for ticker in list(s['entries']) if ENABLE_PAPER_ORDERS else []:
-                    if ticker not in latest and f'{today}:{ticker}:SELL' in s['orders']:
-                        del s['entries'][ticker];state_save(s);log('EXIT_CONFIRMED',ticker)
-            except Exception as e:
-                log('LOOP_ERROR',detail=str(e))
+                        existing=sum(int(v['qty'])*float(v['entry_price'])
+                                     for v in s['dry_positions'].values())
+                        if existing+qty*price>CAPITAL_ASSUMED:continue
+                        # Persist position and buy intent together, before logging.
+                        s['orders'][key]={'status':'DRY_RUN','reason':'RSA_DAILY_ENTRY',
+                            'time':now().isoformat(),'price':price,'qty':qty}
+                        s['dry_positions'][ticker]={'entry_date':today,'entry_price':price,
+                            'atr':atr,'qty':qty,'stop_price':price-ATR_MULT*atr}
+                        state_save(s)
+                        log('DRY_ENTRY_SIGNAL',ticker,
+                            f'qty={qty} assumed_fill={price:.4f} atr={atr:.4f} '
+                            f'stop={price-ATR_MULT*atr:.4f}')
+                    except Exception as e:
+                        log('ENTRY_ERROR',ticker,str(e)[:300])
             time.sleep(POLL_SECONDS)
     finally:
-        trade.close();quote.close();log('STOPPED')
+        if quote is not None:
+            try:quote.close()
+            except Exception:pass
+        log('STOPPED',detail=f'open_dry_positions={len(s["dry_positions"])}')
 
 if __name__=='__main__':main()

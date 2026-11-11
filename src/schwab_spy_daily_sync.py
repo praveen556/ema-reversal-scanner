@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from schwab import auth
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 TOKEN = ROOT / '.schwab_auth' / 'token.json'
 OUTPUT = ROOT / 'data' / 'daily' / 'SPY.csv'
 CALLBACK = os.getenv('SCHWAB_CALLBACK_URL', 'https://127.0.0.1:8182')
