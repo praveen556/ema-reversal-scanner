@@ -1,1 +1,13 @@
+# Credentials / tokens
 /schwab_token.json
+/.schwab_auth/
+
+# Local market data and generated reports
+/data/
+/output/
+/rsa_paper_state/
+
+# Python
+__pycache__/
+*.pyc
+/.venv/
