@@ -50,8 +50,10 @@ def main():
     ap.add_argument('--years', type=float, default=10)
     ap.add_argument('--tickers', nargs='*')
     ap.add_argument('--pause', type=float, default=0.55)
+    ap.add_argument('--out-dir', type=Path, default=OUT)
     a = ap.parse_args()
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = a.out_dir if a.out_dir.is_absolute() else ROOT / a.out_dir
+    out.mkdir(parents=True, exist_ok=True)
     tickers = a.tickers or default_tickers()
     client = get_client()
     end = datetime.now(timezone.utc)
@@ -61,7 +63,7 @@ def main():
     bad = []
     t0 = time.time()
     for i, t in enumerate(tickers, 1):
-        path = OUT / f'{t}.csv'
+        path = out / f'{t}.csv'
         if path.exists():
             skipped += 1
             continue
@@ -86,8 +88,8 @@ def main():
         if i % 100 == 0:
             print(f'{i}/{len(tickers)} ok={ok} skipped={skipped} failed={failed} {time.time() - t0:.0f}s', flush=True)
         time.sleep(a.pause)
-    (OUT / '_failed.txt').write_text('\n'.join(bad))
-    print(f'DONE ok={ok} skipped={skipped} failed={failed} -> {OUT}')
+    (out / '_failed.txt').write_text('\n'.join(bad))
+    print(f'DONE ok={ok} skipped={skipped} failed={failed} -> {out}')
 
 
 if __name__ == '__main__':

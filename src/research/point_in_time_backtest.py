@@ -146,6 +146,23 @@ def process(ticker, d, spy_ret20):
     choppy = (compression < 3.0) & (crosses >= 8)
     hi120 = d['high'].rolling(120).max().to_numpy()
 
+    # ---- Chart-review features: the last 5 months (105 sessions) of daily bars.
+    W = 105
+    hi105 = d['high'].rolling(W).max().to_numpy()
+    lo105 = d['low'].rolling(W).min().to_numpy()
+    hi40 = d['high'].rolling(40).max().to_numpy()
+    lo40 = d['low'].rolling(40).min().to_numpy()
+    logc = np.log(close)
+    corr = logc.rolling(W).corr(pd.Series(idx, index=close.index, dtype=float)).to_numpy()
+    slope105 = corr * logc.rolling(W).std().to_numpy() / np.sqrt((W * W - 1) / 12) * 21 * 100  # % per month
+    lows = d['low']
+    lo_a = lows.rolling(35).min().to_numpy()
+    lo_b, lo_c = lag(lo_a, 35), lag(lo_a, 70)
+    highs35 = d['high'].rolling(35).max().to_numpy()
+    upside = hi105 / C - 1                      # room to the 5-month high
+    downside = 1 - lo20 / C                     # distance to the 20-day low (a natural stop)
+    reward_risk = upside / np.maximum(downside, 0.005)
+
     entry = sh(O, 1)
     fwd = {f'r{k}': sh(C, k) / entry - 1 for k in (3, 5, 10, 20)}
     mfe10 = np.nanmax(np.vstack([sh(H, k) for k in range(1, 11)]), axis=0) / entry - 1
@@ -200,6 +217,14 @@ def process(ticker, d, spy_ret20):
         'atr_pct': atrp * 100, 'ret20': ret20 * 100, 'ret60': (C / lag(C, 60) - 1) * 100,
         'rs20': (ret20 - spy_ret20.reindex(d['date']).to_numpy()) * 100,
         'off_high120': (C / hi120 - 1) * 100,
+        'range105': (hi105 / lo105 - 1) * 100, 'range40': (hi40 / lo40 - 1) * 100,
+        'pos105': (C - lo105) / (hi105 - lo105) * 100,
+        'upside105': upside * 100, 'downside20': downside * 100, 'downside105': (1 - lo105 / C) * 100,
+        'reward_risk': reward_risk,
+        'slope105': slope105, 'r2_105': corr ** 2,
+        'higher_lows': (lo_a > lo_b) & (lo_b > lo_c),
+        'higher_highs': (highs35 > lag(highs35, 35)) & (lag(highs35, 35) > lag(highs35, 70)),
+        'tightening': (hi40 / lo40 - 1) < 0.6 * (hi105 / lo105 - 1),
         'dollar_vol': C * avgvol,
         'gap_next': (entry / C - 1) * 100,
         **fwd, 'mfe10': mfe10, 'mae10': mae10,
